@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-REMOTE_ROOT=/Users/leonwitt/codeMacMini/prediction_markets/hyperliquid-clef
+REMOTE_ROOT=/Users/leonwitt/Projects/hyperliquid-paper-trading-lab
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 -o ForwardAgent=no"
 ACTION=${1:-status}
 case "$ACTION" in
