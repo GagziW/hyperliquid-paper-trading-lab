@@ -143,7 +143,53 @@ task (for example each 30 s); `on_book` only reads the latest answer. If the ans
 missing, the strategy does not trade. The template uses the `mock` model by default, so it runs
 without a key. Put keys only into environment variables, never into a file in this repository.
 
-## 6. Run for 24 hours and compare
+## 6. Backtest your strategy first
+
+A backtest runs your strategy on **recorded** market data. It uses the same engine as the live
+run: the same fees, latency, fills and exits. One day of data takes about one second. Thus you can
+find bugs and bad ideas before you use 24 hours for a live run.
+
+```sh
+uv run python -m pipeline.backtest --binance 2026-11-01..2026-11-07
+```
+
+This command downloads one-second ETH bars from the free Binance archive (about 2 MB for each day;
+the files stay in `runs/binance/`), runs all strategies in `run = [...]` and prints the comparison
+table. If your network cannot reach Binance, get the **course data pack** from your instructor and
+put its folder `binance` into `runs/`. The backtest then uses these files and downloads nothing.
+Use the days of the data pack: then all students backtest on the same data, and the results are
+comparable, as with the fixed simulation settings. The results are in `runs/backtest/<strategy>/`, in the format of a live run: `summary.json`,
+`trades.csv` and `events.jsonl`. To run only one strategy, add `--strategy my_strategy`.
+
+There are two kinds of recorded data:
+
+| | Binance bars: `--binance DAY..DAY` | Your tape: no option, or `--tape PATH` |
+| --- | --- | --- |
+| What it is | One-second price bars of Binance ETH/USDT | The Hyperliquid books and trades that your paper trader received |
+| History | Several years | From the day of your first paper run |
+| Order book | Invented: one tick wide, the same size at each level | The real five levels |
+| Trades | Two for each second: the buyers' volume at the high price, the sellers' volume at the low price | Each public trade |
+| Use it for | Signals from the price and the traded volume, over many days | All signals; a second look at your own live run |
+
+The paper trader records the tape into `runs/paper/_tape/` while it runs (`--no-tape` switches the
+recording off). A backtest of the tape gives your strategy the same events, in the same order, as
+the live run got. You can change one parameter and see what the same day gives.
+
+Know the limits:
+
+- **Bars fill a passive order too easily.** From 10 to 30 October 2026 the example strategy closed
+  42 trades from 57 signals on bars. The live paper run on Hyperliquid closed 12 trades from 46
+  signals. Where both runs traded in the same second, the results were close (−17.7 bp live and
+  −18.5 bp on bars; +8.7 bp and +8.6 bp). Thus a bar backtest shows too many trades. Use the tape
+  when the number of fills is important.
+- **A backtest does not replace the live run.** If you try 50 parameter values and keep the best
+  one, the result looks better than the strategy is. Choose your parameters with backtests on past
+  data. Then do not change them, start the 24-hour live run, and report both results.
+- A strategy with an AI model (a `background` task) is skipped. A backtest cannot ask the model
+  again for each moment of the past.
+- Funding is not modelled, as in the live run.
+
+## 7. Run for 24 hours and compare
 
 ```sh
 uv run python -m pipeline.paper --duration 86400
@@ -160,13 +206,13 @@ Results are in `runs/paper/<strategy>/`:
 | `<config-hash>/events-YYYY-MM-DD.jsonl` | Each signal, order, fill, exit and data gap |
 
 A new set of parameters gets a new `<config-hash>` directory and a new paper account, so results
-never mix. Then:
+never mix. The market data of the run is in `runs/paper/_tape/` (the tape of section 6). Then:
 
 ```sh
 uv run python -m pipeline.compare
 ```
 
-## 7. Deliverables
+## 8. Deliverables
 
 1. **Code**: your strategy file, your `paper.toml` and your tests.
 2. **Run data**: the `runs/paper/` folders of your strategy and of `spike_fade` from the same run.
@@ -175,15 +221,19 @@ uv run python -m pipeline.compare
 4. **Explanation**: explain your strategy in front of the class, including how the program gets the
    live data, which parameters are fixed and which are yours, and how a paper trade fills.
 
-## 8. How the paper trader works
+## 9. How the paper trader works
 
 ```text
 Hyperliquid WebSocket (public): l2Book (5 levels, fast) + trades
   -> pipeline/market.py      Feed: parse, validate, reconnect with backoff
-  -> pipeline/paper.py       one queue, freshness checks, data gaps, logs, all strategies
+  -> pipeline/paper.py       one queue, logs, all strategies; records the tape (pipeline/tape.py)
+  -> pipeline/session.py     freshness checks and data gaps: the SAME for live run and backtest
   -> pipeline/strategies/    YOUR decision: Entry / Exit / None
   -> pipeline/paper_engine.py FIXED simulation: orders, fills, exits, fees, P&L, checkpoint
 ```
+
+A backtest (`pipeline/backtest.py`) reads a tape or Binance bars (`pipeline/bars.py`) and gives the
+events to the same session, the same strategies and the same engine.
 
 **Maker entry (post-only).** A short rests at the best ask, a long at the best bid. A touched price
 is **not** a fill. The first book after the simulated latency must still allow a passive order; an
@@ -214,7 +264,7 @@ whose price path was not observed. Only one process can own an output directory.
 trading profit. Trades crossing hourly funding boundaries are counted. These results must not be
 presented as achievable live performance.
 
-## 9. The example strategy and research findings
+## 10. The example strategy and research findings
 
 `spike_fade` sells short after the mid price rises 0.50% or more within 60 s, with a 0.15%
 take-profit, a 0.50% stop-loss and a 120 s time limit. It is an **example**, not a recommendation:
@@ -223,17 +273,20 @@ take-profit, a 0.50% stop-loss and a 120 s time limit. It is an **example**, not
   data lost 8.0 bp per trade over 5,368 trades. None of 9,000 parameter variants was profitable.
 - After sharp one-minute rises ETH tends to continue rather than revert; after sharp falls it bounces.
 
-Full write-up, data and ideas for other strategies: [RESEARCH.md](RESEARCH.md). Backtest code is in
-`backtest/`; exported paper data of the example is in `data/paper-trading/`.
+Full write-up, data and ideas for other strategies: [RESEARCH.md](RESEARCH.md). The research scripts
+of that write-up are in `backtest/` (they test thousands of spike-fade variants quickly; they cannot
+run your strategy file: use section 6 for that). Exported paper data of the example is in
+`data/paper-trading/`.
 
 ### Instructor: macOS background service
 
 `scripts/paper-service.sh start|stop|status|uninstall` installs the paper trader as a user
 LaunchAgent (`com.prediction-markets.eth-paper`) that restarts after failure and loads at login.
 `scripts/macmini-paper.sh` runs the same commands on a remote Mac over SSH and `fetch` copies the
-results into `runs/macmini-paper/`. Service output is in `runs/service/`.
+results and the tape into `runs/macmini-paper/`. Service output is in `runs/service/`. To backtest
+on the tape of the service: `uv run python -m pipeline.backtest --tape runs/macmini-paper/_tape`.
 
-## 10. Verification
+## 11. Verification
 
 ```sh
 uv run pytest -q

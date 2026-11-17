@@ -25,7 +25,9 @@ from pipeline.config import Settings
 from pipeline.keepawake import keep_awake
 from pipeline.market import Feed, Hyperliquid
 from pipeline.paper_engine import PaperEngine, SimulationConfig
+from pipeline.session import Session
 from pipeline.strategies import has_background, load_strategy
+from pipeline.tape import TapeWriter
 
 
 def replace_file(temp, path, required=True):
@@ -107,6 +109,22 @@ TRADE_COLUMNS = [
 ]
 
 
+def config_hash(simulation, strategy):
+    """The directory name of one set of simulation settings and strategy parameters."""
+    identity = {"simulation": simulation.record(), "strategy": strategy.record()}
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def write_trades(path, trades):
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=TRADE_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        for trade in trades:
+            writer.writerow({**trade, "note": json.dumps(trade.get("note", {}), sort_keys=True)})
+    return replace_file(temp, path, required=False)
+
+
 class PaperLogs:
     """Output of one strategy: <output>/<strategy>/status.json and <output>/<strategy>/<config-hash>/."""
 
@@ -117,9 +135,7 @@ class PaperLogs:
         if not lock_exclusive(self.lock):
             self.lock.close()
             raise ValueError("A paper trader already owns this output directory") from None
-        identity = {"simulation": simulation.record(), "strategy": strategy.record()}
-        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
-        self.path = self.root / fingerprint
+        self.path = self.root / config_hash(simulation, strategy)
         self.path.mkdir(exist_ok=True)
         self.file = None
         self.day = None
@@ -142,13 +158,7 @@ class PaperLogs:
     def save(self, engine, now_ms, running, error=None):
         # The checkpoint is authoritative; CSV is a regenerated view, never an append-only double count.
         write_json(self.path / "state.json", engine.checkpoint())
-        temp = self.path / "trades.csv.tmp"
-        with temp.open("w", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=TRADE_COLUMNS, extrasaction="ignore")
-            writer.writeheader()
-            for trade in engine.trades:
-                writer.writerow({**trade, "note": json.dumps(trade.get("note", {}), sort_keys=True)})
-        replace_file(temp, self.path / "trades.csv", required=False)
+        write_trades(self.path / "trades.csv", engine.trades)
         summary = {
             **engine.summary(now_ms),
             "running": running,
@@ -212,6 +222,7 @@ async def run(simulation, strategies, args):
         raise
     engines = []
     feed_task = None
+    tape = None
     background = {}
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -284,12 +295,19 @@ async def run(simulation, strategies, args):
                 on_book=lambda book: enqueue(("book", book, int(time.time() * 1000))),
                 on_trade=lambda trade: enqueue(("trade", trade, int(time.time() * 1000))),
             )
+            # The session applies the freshness rules; pipeline/backtest.py uses the same class.
+            session = Session(simulation, engines)
+            if not getattr(args, "no_tape", False):
+                tape = TapeWriter(args.output / "_tape", asset, simulation.network)
+
+            def book_age_ms():
+                return feed.book.age_ms() if feed.book is not None else None
+
             feed_task = asyncio.create_task(feed.run())
             for strategy in strategies:
                 if has_background(strategy):
                     background[strategy.name] = asyncio.create_task(strategy.background(feed, client))
             started, last_save = time.monotonic(), 0.0
-            stale = False
             while not stop.is_set() and (args.duration == 0 or time.monotonic() - started < args.duration):
                 event = None
                 try:
@@ -298,38 +316,25 @@ async def run(simulation, strategies, args):
                     pass
                 now_ms = int(time.time() * 1000)
                 if event:
+                    # Each event goes to the tape first, then to the strategies: a backtest of
+                    # the tape gives the strategies the same events in the same order.
                     kind, data, received_ms = event
                     if kind == "book":
-                        age = data.estimated_exchange_age_ms()
-                        if (
-                            data.age_ms() <= simulation.max_book_age_ms
-                            and -250 <= age <= simulation.max_book_age_ms
-                        ):
-                            stale = False
-                            for engine in engines:
-                                engine.on_book(data)
-                        elif not stale:
-                            stale = True
-                            for engine in engines:
-                                engine.gap(now_ms, "stale_book_or_clock_skew")
+                        waited_ms = data.age_ms()
+                        if tape:
+                            tape.book(data, waited_ms)
+                        session.on_book(data, now_ms, waited_ms)
                     elif kind == "trade":
-                        if (
-                            not stale
-                            and feed.book is not None
-                            and feed.book.age_ms() <= simulation.max_book_age_ms
-                        ):
-                            for engine in engines:
-                                engine.on_trade(data, received_ms)
+                        if tape:
+                            tape.trade(data, received_ms)
+                        session.on_trade(data, received_ms, book_age_ms())
                     else:
-                        for engine in engines:
-                            engine.gap(received_ms, data)
-                if feed.book is not None and feed.book.age_ms() > simulation.max_book_age_ms and not stale:
-                    stale = True
-                    for engine in engines:
-                        engine.gap(now_ms, "stale_local_book")
+                        if tape:
+                            tape.gap(data, received_ms)
+                        session.gap(received_ms, data)
+                session.tick(now_ms, book_age_ms())
                 periodic = time.monotonic() - last_save >= 5
                 for engine, item in zip(engines, logs, strict=False):
-                    engine.tick(now_ms)
                     events = engine.drain_events()
                     if events or periodic:
                         summaries[engine.strategy.name] = summary = item.save(engine, now_ms, running=True)
@@ -340,6 +345,8 @@ async def run(simulation, strategies, args):
                         item.emit({"event": "paper_status", **summary})
                 if periodic:
                     last_save = time.monotonic()
+                    if tape:
+                        tape.flush()
                 if feed_task.done():
                     await feed_task
                     raise RuntimeError("Public data task stopped unexpectedly")
@@ -386,6 +393,8 @@ async def run(simulation, strategies, args):
         emit_all({"event": "paper_stopped", "error": error})
         for item in logs:
             item.close()
+        if tape:
+            tape.close()
         remove_handlers()
     print(json.dumps(summaries, indent=2), flush=True)
     return 1 if error else 0
@@ -405,6 +414,11 @@ def main():
         help="Run only this strategy (repeat the option for more). Default: run = [...] in paper.toml",
     )
     parser.add_argument("--allow-sleep", action="store_true", help="Do not keep the computer awake")
+    parser.add_argument(
+        "--no-tape",
+        action="store_true",
+        help="Do not record the market data into <output>/_tape (the backtest needs this recording)",
+    )
     parser.add_argument(
         "--status", action="store_true", help="Read the latest paper status without connecting"
     )

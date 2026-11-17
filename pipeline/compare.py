@@ -1,7 +1,7 @@
-"""Compare the strategies of one paper run side by side.
+"""Compare the strategies of one paper run or of one backtest side by side.
 
 Usage:  uv run python -m pipeline.compare            (reads runs/paper/*/status.json)
-        uv run python -m pipeline.compare runs/paper
+        uv run python -m pipeline.compare runs/backtest
 """
 
 import argparse
@@ -9,7 +9,16 @@ import json
 from decimal import Decimal
 from pathlib import Path
 
+
+def run_type(status):
+    if status.get("mode") != "backtest":
+        return "live paper"
+    bars = (status.get("data") or {}).get("source") == "binance_1s_bars"
+    return "backtest (Binance bars)" if bars else "backtest (tape)"
+
+
 ROWS = [
+    ("run type", run_type),
     ("simulation settings", lambda s: "standard" if s.get("simulation_standard") else "NOT COMPARABLE"),
     ("running", lambda s: "yes" if s.get("running") else "no"),
     ("observed hours", lambda s: f"{s['observed_s'] / 3600:.1f}" if s.get("observed_s") else "-"),
@@ -32,24 +41,33 @@ def number(value, places):
     return "-" if value is None else f"{Decimal(str(value)):.{places}f}"
 
 
+def table(output, names=None):
+    """The comparison as text, or None without results. ``names`` selects strategies."""
+    statuses = {p.parent.name: json.loads(p.read_text()) for p in sorted(output.glob("*/status.json"))}
+    if names is not None:
+        statuses = {name: statuses[name] for name in names if name in statuses}
+    if not statuses:
+        return None
+    names = list(statuses)
+    if "spike_fade" in names:  # the benchmark first
+        names.insert(0, names.pop(names.index("spike_fade")))
+    rows = [["", *names]] + [[label, *(str(f(statuses[n])) for n in names)] for label, f in ROWS]
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    lines = ["  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)) for row in rows]
+    lines.insert(1, "  ".join("-" * width for width in widths))
+    lines.append("\nFunding is not modelled. Paper results do not show live performance.")
+    return "\n".join(lines)
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description="Compare paper strategies of one run")
     parser.add_argument("output", nargs="?", type=Path, default=root / "runs" / "paper")
     args = parser.parse_args()
-    statuses = {p.parent.name: json.loads(p.read_text()) for p in sorted(args.output.glob("*/status.json"))}
-    if not statuses:
+    text = table(args.output)
+    if text is None:
         parser.error(f"No */status.json in {args.output}")
-    names = list(statuses)
-    if "spike_fade" in names:  # the benchmark first
-        names.insert(0, names.pop(names.index("spike_fade")))
-    table = [["", *names]] + [[label, *(str(f(statuses[n])) for n in names)] for label, f in ROWS]
-    widths = [max(len(row[i]) for row in table) for i in range(len(table[0]))]
-    for index, row in enumerate(table):
-        print("  ".join(cell.ljust(width) for cell, width in zip(row, widths, strict=True)))
-        if index == 0:
-            print("  ".join("-" * width for width in widths))
-    print("\nFunding is not modelled. Paper results do not show live performance.")
+    print(text)
 
 
 if __name__ == "__main__":
