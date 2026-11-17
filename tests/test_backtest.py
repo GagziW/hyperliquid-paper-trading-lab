@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gzip
+import hashlib
 import io
 import json
 import sys
@@ -23,6 +24,7 @@ from pipeline.strategies.spike_fade import Params, SpikeFade
 from pipeline.tape import TapeWriter, read_tape, tape_files, tape_header
 
 ASSET = Asset(1, 4)
+REAL_CLIENT = httpx.Client  # before any test replaces it
 TRADE = {"coin": "ETH", "side": "B", "px": "101", "sz": "1", "time": BASE + 2300, "tid": 7}
 
 
@@ -368,19 +370,63 @@ def test_bars_fill_a_passive_entry_only_when_the_price_trades_through_it():
     assert filled["side"] == "long" and filled["entry_price"] == Decimal("100")
 
 
+def fake_binance(monkeypatch, files, status=None, checksums=None):
+    """Serve ``files`` ({day: zip bytes}) and their .CHECKSUM files like data.binance.vision."""
+    requests, checksums = [], checksums or {}
+
+    def handler(request):
+        requests.append(request.url.path)
+        if status:
+            return httpx.Response(status)
+        name = request.url.path.rsplit("/", 1)[-1]
+        for day, blob in files.items():
+            zip_name = f"ETHUSDT-1s-{day}.zip"
+            if name == zip_name:
+                return httpx.Response(200, content=blob)
+            if name == zip_name + ".CHECKSUM":
+                checksum = checksums.get(day, hashlib.sha256(blob).hexdigest())
+                return httpx.Response(200, text=f"{checksum}  {zip_name}\n")
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        bars.httpx, "Client", lambda **kwargs: REAL_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+    )
+    monkeypatch.setattr(bars.time, "sleep", lambda seconds: None)
+    return requests
+
+
 def test_days_and_download_errors(tmp_path, monkeypatch):
     assert bars.days("2026-11-01") == [date(2026, 11, 1)]
     assert len(bars.days("2026-10-30..2026-11-02")) == 4
     for wrong in ("yesterday", "2026-11-02..2026-11-01"):
         with pytest.raises(ValueError):
             bars.days(wrong)
-    codes = iter((404, 500))
-    monkeypatch.setattr(bars.httpx, "get", lambda url, **kwargs: httpx.Response(next(codes)))
+    fake_binance(monkeypatch, {})
     with pytest.raises(ValueError, match="one day later"):
         bars.load_day(date(2026, 11, 1), tmp_path)
-    with pytest.raises(ValueError, match="HTTP 500.*data pack"):
+    requests = fake_binance(monkeypatch, {}, status=500)
+    with pytest.raises(ValueError, match="HTTP 500.*data packs"):
         bars.load_day(date(2026, 11, 1), tmp_path)
+    assert len(requests) == bars.RETRIES
     assert not list(tmp_path.iterdir())
+
+
+def test_download_checks_the_checksum_and_gets_only_missing_days(tmp_path, monkeypatch):
+    good = bar_zip([bar(0, "100", "100", "100", "100")])
+    days = bars.days("2026-10-10..2026-10-12")
+    requests = fake_binance(monkeypatch, {day: good for day in days})
+    bars.day_path(days[0], tmp_path).write_bytes(good)
+    assert bars.download(days, tmp_path, report=lambda line: None) == 2
+    assert all(bars.day_path(day, tmp_path).read_bytes() == good for day in days)
+    assert not any("2026-10-10" in path for path in requests)  # it was in the cache already
+    assert bars.download(days, tmp_path, report=lambda line: None) == 0
+
+    later = date(2026, 10, 13)  # the file changes on the way; the checksum is of the original
+    fake_binance(monkeypatch, {later: b"changed"}, checksums={later: hashlib.sha256(good).hexdigest()})
+    with pytest.raises(ValueError, match="damaged"):
+        bars.download([later], tmp_path, report=lambda line: None)
+    assert not bars.day_path(later, tmp_path).exists()
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ── Command line ────────────────────────────────────────────────────────────────────────
@@ -425,7 +471,7 @@ def test_command_backtests_binance_bars_from_the_cache(tmp_path, monkeypatch, ca
     rows = [bar(second, "100", "100", "100", "100") for second in range(5)]
     (tmp_path / "cache").mkdir()
     (tmp_path / "cache" / "ETHUSDT-1s-2026-10-10.zip").write_bytes(bar_zip(rows))
-    monkeypatch.setattr(bars.httpx, "get", lambda *args, **kwargs: pytest.fail("the cache has this day"))
+    monkeypatch.setattr(bars.httpx, "Client", lambda **kwargs: pytest.fail("the cache has this day"))
     places = ("--cache", tmp_path / "cache", "--output", tmp_path / "out")
     command(tmp_path, monkeypatch, "--binance", "2026-10-10", "--strategy", "spike_fade", *places)
     status = json.loads((tmp_path / "out" / "spike_fade" / "status.json").read_text())

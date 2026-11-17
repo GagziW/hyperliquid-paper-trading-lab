@@ -4,9 +4,9 @@
        "When ... happens, the ETH price ... within ... seconds, because ..."
 2. Put your parameters into ``Params`` and into ``[strategies.my_strategy]`` in paper.toml.
 3. Write your rule in ``on_book`` (and ``on_trade`` if you use trades).
-4. Test it: ``uv run pytest -q``. Backtest it on recorded data (README section 6):
-   ``uv run python -m pipeline.backtest --binance 2026-11-01..2026-11-07``.
-   Then run it next to the example strategy for 24 hours.
+4. Test it: ``uv run pytest -q``. Backtest it on the training year (README section 6):
+   ``uv run python -m pipeline.backtest --binance 2024-11-01..2025-10-31``.
+   Run the test year once, then run it next to the example strategy for 24 hours.
 
 If you rename this file, use the new name in ``run = [...]`` in paper.toml.
 

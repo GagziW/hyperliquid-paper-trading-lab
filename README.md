@@ -149,17 +149,38 @@ A backtest runs your strategy on **recorded** market data. It uses the same engi
 run: the same fees, latency, fills and exits. One day of data takes about one second. Thus you can
 find bugs and bad ideas before you use 24 hours for a live run.
 
+**Step 1: download two years of data (once).**
+
 ```sh
-uv run python -m pipeline.backtest --binance 2026-11-01..2026-11-07
+uv run python -m pipeline.bars 2024-11-01..2026-10-31
 ```
 
-This command downloads one-second ETH bars from the free Binance archive (about 2 MB for each day;
-the files stay in `runs/binance/`), runs all strategies in `run = [...]` and prints the comparison
-table. If your network cannot reach Binance, get the **course data pack** from your instructor and
-put its folder `binance` into `runs/`. The backtest then uses these files and downloads nothing.
-Use the days of the data pack: then all students backtest on the same data, and the results are
-comparable, as with the fixed simulation settings. The results are in `runs/backtest/<strategy>/`, in the format of a live run: `summary.json`,
-`trades.csv` and `events.jsonl`. To run only one strategy, add `--strategy my_strategy`.
+This downloads 730 days of one-second ETH bars from the free Binance archive
+([data.binance.vision](https://data.binance.vision/?prefix=data/spot/daily/klines/ETHUSDT/1s/)),
+about 1.7 GB, into `runs/binance/`. It gets six files at a time and checks each file against the
+checksum that Binance publishes. On the instructor's Mac mini it took about 8 minutes. If it stops,
+run the same command again: it gets only the missing days. If your network cannot reach Binance,
+get the **course data packs** from your instructor and put their folder `binance` into `runs/`.
+
+**Step 2: backtest.** All students use the same two years, so the results are comparable, as with
+the fixed simulation settings:
+
+| Period | Command | Use |
+| --- | --- | --- |
+| Training year | `uv run python -m pipeline.backtest --binance 2024-11-01..2025-10-31` | Choose and tune your parameters here, as often as you like |
+| Test year | `uv run python -m pipeline.backtest --binance 2025-11-01..2026-10-31` | Run **once**, with your final parameters, and report the result |
+| Live run | `uv run python -m pipeline.paper --duration 86400` | 24 hours on new data, after the test year |
+
+The backtest runs all strategies in `run = [...]` and prints the comparison table. To run only one
+strategy, add `--strategy my_strategy`. The results are in `runs/backtest/<strategy>/`, in the
+format of a live run: `summary.json`, `trades.csv` and `events.jsonl`. A backtest with the same
+parameters replaces the previous result.
+
+One year takes about 8 minutes on the instructor's Mac mini (a laptop can be slower). To try an
+idea quickly, backtest one month first, for example `--binance 2025-01-01..2025-01-31`.
+
+For reference, the example strategy `spike_fade` loses in both years: 2,278 trades at −8.2 bp each
+in the training year, 1,702 trades at −9.1 bp each in the test year.
 
 There are two kinds of recorded data:
 
@@ -182,9 +203,10 @@ Know the limits:
   signals. Where both runs traded in the same second, the results were close (−17.7 bp live and
   −18.5 bp on bars; +8.7 bp and +8.6 bp). Thus a bar backtest shows too many trades. Use the tape
   when the number of fills is important.
-- **A backtest does not replace the live run.** If you try 50 parameter values and keep the best
-  one, the result looks better than the strategy is. Choose your parameters with backtests on past
-  data. Then do not change them, start the 24-hour live run, and report both results.
+- **Tune only on the training year.** If you try 50 parameter values and keep the best one, the
+  result on those days looks better than the strategy is. The test year shows the honest result,
+  but only if you did not look at it while you tuned. If you change a parameter after the test
+  run, the test year is not a test any more: say so in your report.
 - A strategy with an AI model (a `background` task) is skipped. A backtest cannot ask the model
   again for each moment of the past.
 - Funding is not modelled, as in the live run.

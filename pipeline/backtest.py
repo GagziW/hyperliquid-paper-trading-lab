@@ -1,6 +1,7 @@
 """Backtest: run your strategies on RECORDED market data, with the same engine as the live run.
 
-    uv run python -m pipeline.backtest --binance 2026-11-01..2026-11-07
+    uv run python -m pipeline.bars 2024-11-01..2026-10-31          (download, once)
+    uv run python -m pipeline.backtest --binance 2024-11-01..2025-10-31
     uv run python -m pipeline.backtest
     uv run python -m pipeline.backtest --tape runs/paper/_tape/2026-11-17T* --strategy my_strategy
 
